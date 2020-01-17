@@ -1,11 +1,11 @@
 /*
- * Copyright 2012-2018 the original author or authors.
+ * Copyright 2012-2020 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *      https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,6 +17,7 @@
 package org.springframework.boot.loader.tools;
 
 import java.io.BufferedInputStream;
+import java.io.BufferedWriter;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -27,13 +28,16 @@ import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.util.Arrays;
 import java.util.Enumeration;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
@@ -52,14 +56,18 @@ import org.apache.commons.compress.archivers.zip.UnixStat;
  *
  * @author Phillip Webb
  * @author Andy Wilkinson
+ * @author Madhura Bhave
+ * @since 1.0.0
  */
 public class JarWriter implements LoaderClassesWriter, AutoCloseable {
-
-	private static final UnpackHandler NEVER_UNPACK = new NeverUnpackHandler();
 
 	private static final String NESTED_LOADER_JAR = "META-INF/loader/spring-boot-loader.jar";
 
 	private static final int BUFFER_SIZE = 32 * 1024;
+
+	private static final int UNIX_FILE_MODE = UnixStat.FILE_FLAG | UnixStat.DEFAULT_FILE_PERM;
+
+	private static final int UNIX_DIR_MODE = UnixStat.DIR_FLAG | UnixStat.DEFAULT_DIR_PERM;
 
 	private final JarArchiveOutputStream jarOutput;
 
@@ -82,8 +90,7 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 	 * @throws IOException if the file cannot be opened
 	 * @throws FileNotFoundException if the file cannot be found
 	 */
-	public JarWriter(File file, LaunchScript launchScript)
-			throws FileNotFoundException, IOException {
+	public JarWriter(File file, LaunchScript launchScript) throws FileNotFoundException, IOException {
 		FileOutputStream fileOutputStream = new FileOutputStream(file);
 		if (launchScript != null) {
 			fileOutputStream.write(launchScript.toByteArray());
@@ -96,8 +103,7 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 	private void setExecutableFilePermission(File file) {
 		try {
 			Path path = file.toPath();
-			Set<PosixFilePermission> permissions = new HashSet<>(
-					Files.getPosixFilePermissions(path));
+			Set<PosixFilePermission> permissions = new HashSet<>(Files.getPosixFilePermissions(path));
 			permissions.add(PosixFilePermission.OWNER_EXECUTE);
 			Files.setPosixFilePermissions(path, permissions);
 		}
@@ -122,22 +128,21 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 	 * @throws IOException if the entries cannot be written
 	 */
 	public void writeEntries(JarFile jarFile) throws IOException {
-		this.writeEntries(jarFile, new IdentityEntryTransformer(), NEVER_UNPACK);
+		this.writeEntries(jarFile, EntryTransformer.NONE, UnpackHandler.NEVER);
 	}
 
 	void writeEntries(JarFile jarFile, UnpackHandler unpackHandler) throws IOException {
-		this.writeEntries(jarFile, new IdentityEntryTransformer(), unpackHandler);
+		this.writeEntries(jarFile, EntryTransformer.NONE, unpackHandler);
 	}
 
-	void writeEntries(JarFile jarFile, EntryTransformer entryTransformer,
-			UnpackHandler unpackHandler) throws IOException {
+	void writeEntries(JarFile jarFile, EntryTransformer entryTransformer, UnpackHandler unpackHandler)
+			throws IOException {
 		Enumeration<JarEntry> entries = jarFile.entries();
 		while (entries.hasMoreElements()) {
 			JarArchiveEntry entry = new JarArchiveEntry(entries.nextElement());
 			setUpEntry(jarFile, entry);
-			try (ZipHeaderPeekInputStream inputStream = new ZipHeaderPeekInputStream(
-					jarFile.getInputStream(entry))) {
-				EntryWriter entryWriter = new InputStreamEntryWriter(inputStream, true);
+			try (ZipHeaderPeekInputStream inputStream = new ZipHeaderPeekInputStream(jarFile.getInputStream(entry))) {
+				EntryWriter entryWriter = new InputStreamEntryWriter(inputStream);
 				JarArchiveEntry transformedEntry = entryTransformer.transform(entry);
 				if (transformedEntry != null) {
 					writeEntry(transformedEntry, entryWriter, unpackHandler);
@@ -147,8 +152,7 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 	}
 
 	private void setUpEntry(JarFile jarFile, JarArchiveEntry entry) throws IOException {
-		try (ZipHeaderPeekInputStream inputStream = new ZipHeaderPeekInputStream(
-				jarFile.getInputStream(entry))) {
+		try (ZipHeaderPeekInputStream inputStream = new ZipHeaderPeekInputStream(jarFile.getInputStream(entry))) {
 			if (inputStream.hasZipHeader() && entry.getMethod() != ZipEntry.STORED) {
 				new CrcAndSize(inputStream).setupStoredEntry(entry);
 			}
@@ -167,7 +171,12 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 	@Override
 	public void writeEntry(String entryName, InputStream inputStream) throws IOException {
 		JarArchiveEntry entry = new JarArchiveEntry(entryName);
-		writeEntry(entry, new InputStreamEntryWriter(inputStream, true));
+		try {
+			writeEntry(entry, new InputStreamEntryWriter(inputStream));
+		}
+		finally {
+			inputStream.close();
+		}
 	}
 
 	/**
@@ -176,14 +185,36 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 	 * @param library the library
 	 * @throws IOException if the write fails
 	 */
-	public void writeNestedLibrary(String destination, Library library)
-			throws IOException {
+	public void writeNestedLibrary(String destination, Library library) throws IOException {
 		File file = library.getFile();
 		JarArchiveEntry entry = new JarArchiveEntry(destination + library.getName());
 		entry.setTime(getNestedLibraryTime(file));
 		new CrcAndSize(file).setupStoredEntry(entry);
-		writeEntry(entry, new InputStreamEntryWriter(new FileInputStream(file), true),
-				new LibraryUnpackHandler(library));
+		try (FileInputStream input = new FileInputStream(file)) {
+			writeEntry(entry, new InputStreamEntryWriter(input), new LibraryUnpackHandler(library));
+		}
+	}
+
+	/**
+	 * Write a simple index file containing the specified UTF-8 lines.
+	 * @param location the location of the index file
+	 * @param lines the lines to write
+	 * @throws IOException if the write fails
+	 * @since 2.3.0
+	 */
+	public void writeIndexFile(String location, List<String> lines) throws IOException {
+		if (location != null) {
+			JarArchiveEntry entry = new JarArchiveEntry(location);
+			writeEntry(entry, (outputStream) -> {
+				BufferedWriter writer = new BufferedWriter(
+						new OutputStreamWriter(outputStream, StandardCharsets.UTF_8));
+				for (String line : lines) {
+					writer.write(line);
+					writer.write("\n");
+				}
+				writer.flush();
+			});
+		}
 	}
 
 	private long getNestedLibraryTime(File file) {
@@ -222,13 +253,11 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 	@Override
 	public void writeLoaderClasses(String loaderJarResourceName) throws IOException {
 		URL loaderJar = getClass().getClassLoader().getResource(loaderJarResourceName);
-		try (JarInputStream inputStream = new JarInputStream(
-				new BufferedInputStream(loaderJar.openStream()))) {
+		try (JarInputStream inputStream = new JarInputStream(new BufferedInputStream(loaderJar.openStream()))) {
 			JarEntry entry;
 			while ((entry = inputStream.getNextJarEntry()) != null) {
 				if (entry.getName().endsWith(".class")) {
-					writeEntry(new JarArchiveEntry(entry),
-							new InputStreamEntryWriter(inputStream, false));
+					writeEntry(new JarArchiveEntry(entry), new InputStreamEntryWriter(inputStream));
 				}
 			}
 		}
@@ -243,9 +272,8 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 		this.jarOutput.close();
 	}
 
-	private void writeEntry(JarArchiveEntry entry, EntryWriter entryWriter)
-			throws IOException {
-		writeEntry(entry, entryWriter, NEVER_UNPACK);
+	private void writeEntry(JarArchiveEntry entry, EntryWriter entryWriter) throws IOException {
+		writeEntry(entry, entryWriter, UnpackHandler.NEVER);
 	}
 
 	/**
@@ -256,24 +284,12 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 	 * @param unpackHandler handles possible unpacking for the entry
 	 * @throws IOException in case of I/O errors
 	 */
-	private void writeEntry(JarArchiveEntry entry, EntryWriter entryWriter,
-			UnpackHandler unpackHandler) throws IOException {
-		String parent = entry.getName();
-		if (parent.endsWith("/")) {
-			parent = parent.substring(0, parent.length() - 1);
-			entry.setUnixMode(UnixStat.DIR_FLAG | UnixStat.DEFAULT_DIR_PERM);
-		}
-		else {
-			entry.setUnixMode(UnixStat.FILE_FLAG | UnixStat.DEFAULT_FILE_PERM);
-		}
-		if (parent.lastIndexOf('/') != -1) {
-			parent = parent.substring(0, parent.lastIndexOf('/') + 1);
-			if (!parent.isEmpty()) {
-				writeEntry(new JarArchiveEntry(parent), null, unpackHandler);
-			}
-		}
-
-		if (this.writtenEntries.add(entry.getName())) {
+	private void writeEntry(JarArchiveEntry entry, EntryWriter entryWriter, UnpackHandler unpackHandler)
+			throws IOException {
+		String name = entry.getName();
+		writeParentFolderEntries(name);
+		if (this.writtenEntries.add(name)) {
+			entry.setUnixMode(name.endsWith("/") ? UNIX_DIR_MODE : UNIX_FILE_MODE);
 			entryWriter = addUnpackCommentIfNecessary(entry, entryWriter, unpackHandler);
 			this.jarOutput.putArchiveEntry(entry);
 			if (entryWriter != null) {
@@ -283,16 +299,25 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 		}
 	}
 
-	private EntryWriter addUnpackCommentIfNecessary(JarArchiveEntry entry,
-			EntryWriter entryWriter, UnpackHandler unpackHandler) throws IOException {
+	private void writeParentFolderEntries(String name) throws IOException {
+		String parent = name.endsWith("/") ? name.substring(0, name.length() - 1) : name;
+		while (parent.lastIndexOf('/') != -1) {
+			parent = parent.substring(0, parent.lastIndexOf('/'));
+			if (!parent.isEmpty()) {
+				writeEntry(new JarArchiveEntry(parent + "/"), null, UnpackHandler.NEVER);
+			}
+		}
+	}
+
+	private EntryWriter addUnpackCommentIfNecessary(JarArchiveEntry entry, EntryWriter entryWriter,
+			UnpackHandler unpackHandler) throws IOException {
 		if (entryWriter == null || !unpackHandler.requiresUnpack(entry.getName())) {
 			return entryWriter;
 		}
 		ByteArrayOutputStream output = new ByteArrayOutputStream();
 		entryWriter.write(output);
 		entry.setComment("UNPACK:" + unpackHandler.sha1Hash(entry.getName()));
-		return new InputStreamEntryWriter(new ByteArrayInputStream(output.toByteArray()),
-				true);
+		return new InputStreamEntryWriter(new ByteArrayInputStream(output.toByteArray()));
 	}
 
 	/**
@@ -316,11 +341,8 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 
 		private final InputStream inputStream;
 
-		private final boolean close;
-
-		InputStreamEntryWriter(InputStream inputStream, boolean close) {
+		InputStreamEntryWriter(InputStream inputStream) {
 			this.inputStream = inputStream;
-			this.close = close;
 		}
 
 		@Override
@@ -331,9 +353,6 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 				outputStream.write(buffer, 0, bytesRead);
 			}
 			outputStream.flush();
-			if (this.close) {
-				this.inputStream.close();
-			}
 		}
 
 	}
@@ -357,8 +376,7 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 			super(in);
 			this.header = new byte[4];
 			this.headerLength = in.read(this.header);
-			this.headerStream = new ByteArrayInputStream(this.header, 0,
-					this.headerLength);
+			this.headerStream = new ByteArrayInputStream(this.header, 0, this.headerLength);
 		}
 
 		@Override
@@ -381,8 +399,7 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 
 		@Override
 		public int read(byte[] b, int off, int len) throws IOException {
-			int read = (this.headerStream != null) ? this.headerStream.read(b, off, len)
-					: -1;
+			int read = (this.headerStream != null) ? this.headerStream.read(b, off, len) : -1;
 			if (read <= 0) {
 				return readRemainder(b, off, len);
 			}
@@ -399,7 +416,7 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 			return read;
 		}
 
-		public boolean hasZipHeader() {
+		boolean hasZipHeader() {
 			return Arrays.equals(this.header, ZIP_HEADER);
 		}
 
@@ -441,7 +458,7 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 			}
 		}
 
-		public void setupStoredEntry(JarArchiveEntry entry) {
+		void setupStoredEntry(JarArchiveEntry entry) {
 			entry.setSize(this.size);
 			entry.setCompressedSize(this.size);
 			entry.setCrc(this.crc.getValue());
@@ -454,21 +471,15 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 	 * An {@code EntryTransformer} enables the transformation of {@link JarEntry jar
 	 * entries} during the writing process.
 	 */
+	@FunctionalInterface
 	interface EntryTransformer {
 
+		/**
+		 * No-op entity transformer.
+		 */
+		EntryTransformer NONE = (jarEntry) -> jarEntry;
+
 		JarArchiveEntry transform(JarArchiveEntry jarEntry);
-
-	}
-
-	/**
-	 * An {@code EntryTransformer} that returns the entry unchanged.
-	 */
-	private static final class IdentityEntryTransformer implements EntryTransformer {
-
-		@Override
-		public JarArchiveEntry transform(JarArchiveEntry jarEntry) {
-			return jarEntry;
-		}
 
 	}
 
@@ -478,23 +489,23 @@ public class JarWriter implements LoaderClassesWriter, AutoCloseable {
 	 */
 	interface UnpackHandler {
 
+		UnpackHandler NEVER = new UnpackHandler() {
+
+			@Override
+			public boolean requiresUnpack(String name) {
+				return false;
+			}
+
+			@Override
+			public String sha1Hash(String name) throws IOException {
+				throw new UnsupportedOperationException();
+			}
+
+		};
+
 		boolean requiresUnpack(String name);
 
 		String sha1Hash(String name) throws IOException;
-
-	}
-
-	private static final class NeverUnpackHandler implements UnpackHandler {
-
-		@Override
-		public boolean requiresUnpack(String name) {
-			return false;
-		}
-
-		@Override
-		public String sha1Hash(String name) {
-			throw new UnsupportedOperationException();
-		}
 
 	}
 
